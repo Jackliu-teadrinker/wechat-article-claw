@@ -1,8 +1,8 @@
 ---
 name: wechat-article-claw
 description: >
-  微信公众号 AI 阅读工具：基于 Exa MCP 搜索 + 全文抓取。
-  支持关键词搜索公众号文章、指定 URL 获取正文，零配置安装。
+  微信公众号 AI 阅读工具：基于 Exa MCP 搜索 + Jina Reader 抓取（Camoufox/Exa fallback）。
+  支持关键词搜索公众号文章、指定 URL 获取正文，含内容有效性校验。
   当用户发送微信文章链接、或要求搜索/读取公众号文章时激活。
 triggers:
   - wechat: 微信/公众号/微信文章/mp.weixin/读一下这个链接/帮我读公众号
@@ -16,13 +16,16 @@ metadata:
 
 # wechat-article-claw
 
-微信公众号 AI 阅读工具。基于 Exa MCP API 直接实现，零配置安装。
+微信公众号 AI 阅读工具。三层抓取策略，搜索 + 全文获取一体化。
 
-## 工作原理
+## 架构
 
-- **搜索**：`web_search_exa` 在 `site:mp.weixin.qq.com` 范围检索，返回标题、URL、作者、摘要
-- **抓取**：`web_fetch_exa` 从 Exa 索引缓存读取已收录页面的正文
-- **认证**：自动通过 `gh auth token` 获取，无需手动配置 API Key
+| 步骤 | 工具 | 说明 |
+|------|------|------|
+| 搜索 | Exa MCP | `web_search_exa` 在 `site:mp.weixin.qq.com` 范围检索 |
+| 抓取（首选） | Jina Reader | `https://r.jina.ai/{url}`，微信专用渲染支持 |
+| Fallback 1 | Camoufox | Jina 失败时触发，需 `~/.agent-reach/tools/wechat-article-for-ai` |
+| Fallback 2 | Exa fetch | `web_fetch_exa`，最后兜底 |
 
 ## 使用场景
 
@@ -36,33 +39,28 @@ metadata:
 python fetch.py search "具身智能 机器人 2026"
 ```
 
-返回：标题、URL、作者、摘要片段（highlights）
-
-### 2. 抓取文章全文
+### 2. 抓取文章全文（自动三层策略）
 
 ```bash
-python fetch.py fetch "https://mp.weixin.qq.com/s/YglEN7JAfPcyS97gtAiyxw"
+python fetch.py fetch "https://mp.weixin.qq.com/s/abc123"
 ```
 
-返回：完整正文（Markdown 格式），保存到临时文件
+## 内容有效性校验
 
-## 快速示例
-
-```
-用户：「https://mp.weixin.qq.com/s/abc123」
-→ python fetch.py fetch "https://mp.weixin.qq.com/s/abc123"
-→ 返回文章正文
-
-用户：「帮我搜一下具身智能相关的公众号文章」
-→ python fetch.py search "具身智能 机器人"
-→ 返回搜索结果列表（含 URL）
-```
+`fetch.py` 内置 `is_valid_content()` 检查，抓取后自动判断是否成功：
+- 拒绝正文 < 100 字符
+- 拒绝含「环境异常」「违规无法查看」「verify」等反爬信号
+- 输出 `Valid: True/False` 标注
 
 ## 已知限制
 
-- 刚发布的新文章、小众公众号文章可能未被 Exa 索引
-- 搜索结果按相关度排序，`highlights` 是摘要片段，非完整正文
-- 如搜索到目标文章，再调用 `fetch` 获取全文
+| 场景 | 状态 |
+|------|------|
+| 热门公众号文章搜索 | ✅ 可靠 |
+| Jina Reader 抓取 | ✅ 成功率最高 |
+| 冷门/刚发布文章 | ⚠️ 不稳定，触发 fallback |
+| 监控特定公众号更新 | ❌ 需用 WeWe RSS（微信读书账号） |
+| 图片持久化 | ❌ 微信 CDN 签名有时效，需额外下载 |
 
 ## 安装依赖
 
@@ -70,11 +68,8 @@ python fetch.py fetch "https://mp.weixin.qq.com/s/YglEN7JAfPcyS97gtAiyxw"
 pip install requests
 ```
 
-仅需 `requests` 库，无其他依赖。
-
 ## 技术细节
 
-- Exa MCP 端点：`https://mcp.exa.ai/mcp`（SSE 协议）
-- 搜索 API：`web_search_exa`
-- 抓取 API：`web_fetch_exa`
-- 返回格式：搜索为拼接字符串（需解析），抓取为直接正文
+- Exa MCP 端点：`https://mcp.exa.ai/mcp`（搜索用）
+- Jina Reader：无需认证，免费额度充足
+- Camoufox：可选，需提前安装 wechat-article-for-ai

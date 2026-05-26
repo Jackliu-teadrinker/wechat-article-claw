@@ -1,19 +1,23 @@
 """
 wechat-article-claw
 微信公众号文章搜索与抓取工具
-基于 Exa MCP API 直接调用
 
-用法：
-  python fetch.py search <关键词>
-  python fetch.py fetch <微信URL>
+架构：
+  search  → Exa MCP（搜索，保持现状）
+  read   → Jina Reader（首选）
+  read   → Camoufox（fallback，Jina 失败时）
+  read   → Exa fetch（最后 fallback）
 """
-import requests, json, sys, os, re, subprocess
+import requests, json, sys, os, re, subprocess, time
 
 EXA_MCP_URL = "https://mcp.exa.ai/mcp"
+TEMP_DIR = os.environ.get("TEMP", "/tmp")
 
+# ─────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────
 
 def get_token():
-    """从 gh auth 获取当前登录用户的 token。"""
     try:
         r = subprocess.run(
             ["gh", "auth", "token"],
@@ -28,27 +32,17 @@ def get_token():
 
 
 def exa_call(tool_name, arguments, timeout=30):
-    """直接对 Exa MCP 发送 JSON-RPC 请求，解析 SSE 响应。"""
-    token = get_token()
+    """直调 Exa MCP JSON-RPC，解析 SSE 响应。"""
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments}
+    }
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream"
     }
-    # 如果有 gh token，加上 Authorization
-    if token:
-        # Exa MCP 不需要 Authorization，它通过 ghcli-session 认证
-        pass
-
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments}
-    }
     r = requests.post(EXA_MCP_URL, json=payload, headers=headers, timeout=timeout)
     r.raise_for_status()
-
-    # 强制用 UTF-8 解码（Exa 返回 UTF-8 的 SSE）
     text = r.content.decode("utf-8", errors="replace").strip()
     for line in text.split("\n"):
         if line.startswith("data: "):
@@ -59,10 +53,27 @@ def exa_call(tool_name, arguments, timeout=30):
     return {"error": "no data in response"}
 
 
-FIELD_STARTS = ("Title: ", "URL: ", "Author: ", "Published: ", "Highlights:")
+def is_valid_content(text: str) -> bool:
+    """内容有效性校验。微信反爬/违规/正文太短均返回 False。"""
+    if not text or len(text.strip()) < 100:
+        return False
+    rejection_signals = [
+        "环境异常",
+        "打开次数已到限制",
+        "此内容因违规无法查看",
+        "verify",
+        "无法访问",
+        "No article found",
+        "CRAWL_LIVECRAWL_TIMEOUT",
+    ]
+    return not any(s in text for s in rejection_signals)
 
 
-def parse_search_text(text):
+# ─────────────────────────────────────────
+# 搜索（Exa MCP，保持现状）
+# ─────────────────────────────────────────
+
+def parse_search_text(text: str) -> dict:
     """解析 web_search_exa 返回的拼接文本。"""
     article = {}
     current_key = None
@@ -73,29 +84,21 @@ def parse_search_text(text):
         stripped = line
 
         if stripped.startswith("Title: "):
-            new_key = "Title"
-            stripped = stripped[7:]
+            new_key = "Title"; stripped = stripped[7:]
         elif stripped.startswith("URL: "):
-            new_key = "URL"
-            stripped = stripped[5:]
+            new_key = "URL"; stripped = stripped[5:]
         elif stripped.startswith("Author: "):
-            new_key = "Author"
-            stripped = stripped[8:]
+            new_key = "Author"; stripped = stripped[8:]
         elif stripped.startswith("Author:"):
-            new_key = "Author"
-            stripped = stripped[7:]
+            new_key = "Author"; stripped = stripped[7:]
         elif stripped.startswith("Published: "):
-            new_key = "Published"
-            stripped = stripped[11:]
+            new_key = "Published"; stripped = stripped[11:]
         elif stripped.startswith("Published:"):
-            new_key = "Published"
-            stripped = stripped[10:]
+            new_key = "Published"; stripped = stripped[10:]
         elif stripped.startswith("Highlights:"):
-            new_key = "Highlights"
-            stripped = stripped[11:]
+            new_key = "Highlights"; stripped = stripped[11:]
         elif stripped.startswith("Highlights: "):
-            new_key = "Highlights"
-            stripped = stripped[12:]
+            new_key = "Highlights"; stripped = stripped[12:]
 
         if new_key:
             if current_key:
@@ -110,8 +113,7 @@ def parse_search_text(text):
     return article
 
 
-def search_wechat(query, num_results=5):
-    """搜索微信公众号文章。"""
+def search_wechat(query: str, num_results: int = 5) -> dict:
     result = exa_call("web_search_exa", {
         "query": f"site:mp.weixin.qq.com {query}",
         "numResults": num_results
@@ -124,35 +126,102 @@ def search_wechat(query, num_results=5):
         text = item.get("text", "") if isinstance(item, dict) else str(item)
         article = parse_search_text(text)
         articles.append({
-            "title": article.get("Title", ""),
-            "url": article.get("URL", ""),
-            "author": article.get("Author", ""),
+            "title":   article.get("Title", ""),
+            "url":     article.get("URL", ""),
+            "author":  article.get("Author", ""),
             "published": article.get("Published", ""),
             "highlights": article.get("Highlights", ""),
         })
     return {"articles": articles}
 
 
-def fetch_article(url, max_chars=8000):
-    """抓取指定 URL 的文章正文。"""
+# ─────────────────────────────────────────
+# 抓取
+# ─────────────────────────────────────────
+
+def fetch_jina(url: str) -> str:
+    """Jina Reader 抓取，最简单直接。"""
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {
+        "Accept": "text/markdown",
+        "X-No-Cache": "true",
+        "X-Return-Format": "text"
+    }
+    r = requests.get(jina_url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+
+def fetch_camoufox(url: str) -> str:
+    """Camoufox fallback——需要 wechat-article-for-ai 工具已安装。"""
+    tool_path = os.path.expanduser("~/.agent-reach/tools/wechat-article-for-ai")
+    main_py = os.path.join(tool_path, "main.py")
+    if not os.path.exists(main_py):
+        return "[Camoufox not installed at ~/.agent-reach/tools/wechat-article-for-ai]"
+
+    r = subprocess.run(
+        [sys.executable, main_py, url],
+        capture_output=True, text=True, timeout=60,
+        encoding="utf-8", errors="replace"
+    )
+    if r.returncode != 0:
+        return f"[Camoufox error: {r.stderr[:200]}]"
+    return r.stdout
+
+
+def fetch_exa(url: str, max_chars: int = 10000) -> str:
+    """Exa fetch 最后 fallback。"""
     result = exa_call("web_fetch_exa", {
         "urls": [url],
         "maxCharacters": max_chars
     })
     if "error" in result:
-        return {"error": result["error"]}
+        return f"[Exa error: {result['error']}]"
 
     content_list = result.get("content", [])
     if not content_list:
-        return {"error": "no content returned"}
-
+        return "[Exa returned empty content]"
     first = content_list[0]
-    text = first.get("text", "") if isinstance(first, dict) else str(first)
-    return {"text": text, "url": url}
+    return first.get("text", "") if isinstance(first, dict) else str(first)
 
 
-def cmd_search(query):
-    """执行搜索命令。"""
+def fetch_article(url: str) -> dict:
+    """
+    三层抓取策略：
+      1. Jina Reader（最快，成功率最高）
+      2. Camoufox（Jina 失败时 fallback）
+      3. Exa fetch（最后 fallback）
+    返回 {"text": str, "source": str}
+    """
+    # 1. Jina Reader
+    try:
+        text = fetch_jina(url)
+        if is_valid_content(text):
+            return {"text": text, "source": "jina"}
+    except Exception as e:
+        pass
+
+    # 2. Camoufox
+    try:
+        text = fetch_camoufox(url)
+        if is_valid_content(text):
+            return {"text": text, "source": "camoufox"}
+    except Exception:
+        pass
+
+    # 3. Exa fetch
+    text = fetch_exa(url)
+    if is_valid_content(text):
+        return {"text": text, "source": "exa"}
+
+    return {"text": text, "source": "all-failed"}
+
+
+# ─────────────────────────────────────────
+# 命令行接口
+# ─────────────────────────────────────────
+
+def cmd_search(query: str):
     print(f"[*] Searching: {query}", flush=True)
     result = search_wechat(query)
     if "error" in result:
@@ -160,42 +229,48 @@ def cmd_search(query):
         return
 
     articles = result.get("articles", [])
-    out_path = os.path.join(os.environ.get("TEMP", "/tmp"), "wechat_search_result.txt")
+    out_path = os.path.join(TEMP_DIR, "wechat_search_result.txt")
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"Query: {query}\n")
-        f.write(f"Found: {len(articles)} results\n\n")
+        f.write(f"Query: {query}\nFound: {len(articles)} results\n\n")
         for i, art in enumerate(articles, 1):
             f.write(f"--- Result {i} ---\n")
             f.write(f"Title: {art['title']}\n")
             f.write(f"URL: {art['url']}\n")
             f.write(f"Author: {art['author']}\n")
             f.write(f"Published: {art['published']}\n")
-            hl = art['highlights']
+            hl = art["highlights"]
             if hl:
                 f.write(f"Highlights: {hl[:600]}\n")
             f.write("\n")
     print(f"[+] Saved: {out_path}", flush=True)
-    print(f"[+] Found {len(articles)} results - see file for details", flush=True)
+    print(f"[+] Found {len(articles)} results", flush=True)
     for i, art in enumerate(articles[:3], 1):
-        print(f"  [{i}] {art['title'][:50]} — {art['url'][:60]}", flush=True)
+        print(f"  [{i}] {art['title'][:50]}", flush=True)
 
 
-def cmd_fetch(url):
-    """执行抓取命令。"""
+def cmd_fetch(url: str):
     print(f"[*] Fetching: {url}", flush=True)
-    result = fetch_article(url)
-    if "error" in result:
-        print(f"[!] Error: {result['error']}", flush=True)
-        return
+    r = fetch_article(url)
 
-    text = result["text"]
-    safe_name = re.sub(r'[<>:"/\\|?*]', '_', url.split("/s/")[1][:30] if "/s/" in url else "article")
-    out_path = os.path.join(os.environ.get("TEMP", "/tmp"), f"wechat_{safe_name}.txt")
+    text = r["text"]
+    source = r["source"]
+    valid = is_valid_content(text)
+
+    safe_name = re.sub(
+        r'[<>:"/\\|?*]', "_",
+        url.split("/s/")[1][:30] if "/s/" in url else "article"
+    )
+    out_path = os.path.join(TEMP_DIR, f"wechat_{safe_name}.txt")
+
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"URL: {url}\n\n")
+        f.write(f"URL: {url}\nSource: {source}\nValid: {valid}\n\n")
         f.write(text)
+
     print(f"[+] Saved: {out_path}", flush=True)
-    print(f"[+] Length: {len(text)} chars", flush=True)
+    print(f"[+] Length: {len(text)} chars | Source: {source} | Valid: {valid}", flush=True)
+
+    if not valid:
+        print("[!] Warning: content may be invalid or blocked", flush=True)
 
 
 def main():

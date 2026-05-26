@@ -1,7 +1,7 @@
 ---
 name: wechat-article-claw
 description: >
-  微信公众号 AI 阅读工具：基于微信手机客户端UA绕过验证码，直接抓取正文。
+  微信公众号 AI 阅读工具：微信手机客户端UA绕过验证码，无需Cookie，无需Selenium。
   支持关键词搜索公众号文章、指定URL获取正文（纯文本），零配置安装。
   当用户发送微信文章链接、或要求搜索/读取公众号文章时激活。
 triggers:
@@ -21,6 +21,29 @@ metadata:
 ## 技术原理
 
 微信的滑块验证码只针对普通浏览器，微信内置浏览器有有效会话不触发验证。通过在请求头中填入微信手机客户端 UA，伪装成微信内置浏览器，直接获取 HTML 正文。
+
+## ⚠️ UA 版本号维护
+
+微信会定期升级客户端，UA 版本号需同步更新。
+
+**当前版本**：`MicroMessenger/8.0.47.2504`（2026-05-26）
+
+**更新方法**：
+```bash
+# 查询最新版本
+python check_wechat_version.py
+
+# 如果发现新版本，手动修改 wechat-fetch.py 中的：
+# 1. WX_MOBILE_UA 字符串中的 MicroMessenger/8.0.47.2504
+# 2. WX_VERSION = "8.0.47.2504"
+```
+
+**版本格式**：`MicroMessenger/{大版本}.{小版本}.{修订版本}({build号})`
+例如：`8.0.73.1360` → `MicroMessenger/8.0.73.1360`
+
+**查询最新版本**：
+- 微信手机 App → 设置 → 关于微信 → 版本号
+- https://www.wxpr.org/
 
 ## 架构
 
@@ -47,6 +70,12 @@ python wechat-fetch.py "https://mp.weixin.qq.com/s/abc123"
 python wechat-fetch.py "https://mp.weixin.qq.com/s/abc123" "output.txt"
 ```
 
+### 3. 查询/更新 UA 版本
+
+```bash
+python check_wechat_version.py
+```
+
 ## 快速示例
 
 ```
@@ -59,6 +88,16 @@ python wechat-fetch.py "https://mp.weixin.qq.com/s/abc123" "output.txt"
 → 返回搜索结果列表（含 URL）
 ```
 
+## 场景对比
+
+| 方案 | 成功率 | 速度 | 内容质量 | 适合场景 |
+|------|--------|------|---------|---------|
+| **微信手机UA（wechat-fetch.py）** | ⭐⭐⭐⭐⭐ | 快 | 纯文本 | ✅ 临时抓取、快速获取文字内容 |
+| Exa fetch | ⭐⭐（仅已收录文章）| 快 | 完整 | ⚠️ 4周前的旧文章、备选 |
+| Jina Reader | ⭐（微信拦截）| 快 | 较好 | ❌ 微信文章不适用 |
+| Camoufox | ⭐⭐⭐（rate limit）| 慢 | 完整HTML+渲染 | ⚠️ 其他方案全部失效时的兜底 |
+| WeWe RSS | ⭐⭐⭐⭐（需部署）| 中 | 完整 | ✅ 定期监控某个公众号（需Docker部署） |
+
 ## 已知限制
 
 | 场景 | 状态 |
@@ -68,11 +107,4 @@ python wechat-fetch.py "https://mp.weixin.qq.com/s/abc123" "output.txt"
 | 冷门/刚发布/小众账号文章 | ✅ 微信UA绕过验证，成功率高 |
 | 微信图片/视频内容 | ❌ 仅纯文本 |
 | 获取阅读量/点赞数 | ❌ 不支持 |
-| 监控特定公众号更新 | ❌ 需用 WeWe RSS（微信读书账号） |
-
-## 技术细节
-
-- 微信手机 UA：`MicroMessenger/8.0.47.2504(0x80003003)`
-- 仅需 `requests` 库（Python 内置，无需额外依赖）
-- 正文提取：从 HTML 的 `id="js_content"` div 中提取纯文本
-- 成功率：经实测，四篇之前全部 CRAWL_LIVECRAWL_TIMEOUT 的文章均成功抓取（1.1万字/3449字/1908字/6585字）
+| 定期监控特定公众号 | ⚠️ 需 WeWe RSS（Docker部署）；可用 RSS 阅读器订阅 Exa 搜索结果作为替代 |

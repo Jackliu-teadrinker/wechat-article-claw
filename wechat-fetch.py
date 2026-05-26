@@ -2,19 +2,36 @@
 wechat-fetch.py
 微信公众号文章抓取——通过微信手机客户端UA绕过验证码
 
-原理：微信滑块验证码只针对普通浏览器，微信内置浏览器有有效会话不触发验证。
-通过在请求头中填入微信手机客户端 UA，伪装成微信内置浏览器，直接获取HTML正文。
+核心方法：用微信内置浏览器的 UA 伪装已登录 Session，直接绕过滑块验证码。
 
-用法：
-  python wechat-fetch.py <微信URL> [输出路径]
+═══════════════════════════════════════════════════════════════
+⚠️ UA 版本号维护（Jack 2026-05-26）
+═══════════════════════════════════════════════════════════════
+当前版本：MicroMessenger/8.0.47.2504
+
+更新方法：
+  1. 查询微信 Android 最新版本
+     - 微信手机 App -> 设置 -> 关于微信 -> 版本号
+     - 或搜索 https://www.wxpr.org/ 查看最新版本
+  2. UA 格式：MicroMessenger/{大版本}.{小版本}.{修订版本}({build号})
+     - 例如：8.0.73.1360 对应 MicroMessenger/8.0.73.1360
+  3. 修改下方 WX_MOBILE_UA 常量中的 MicroMessenger 版本号
+
+版本历史：
+  2026-05-26  MicroMessenger/8.0.47.2504  初始版本
+
+监控脚本：运行 python check_wechat_version.py 自动查询最新版本
+═══════════════════════════════════════════════════════════════
 """
 import requests, re, sys, os
 
+# ⚠️ 每次微信更新后，手动修改这里
 WX_MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36 "
     "MicroMessenger/8.0.47.2504(0x80003003) NetType/WIFI Language/zh_CN"
 )
+WX_VERSION = "8.0.47.2504"
 TIMEOUT = 20
 
 
@@ -78,7 +95,7 @@ def fetch_wechat_article(url: str) -> tuple[str, str]:
     if not text or len(text.strip()) < 100:
         return "", "extraction-failed"
 
-    return text, "wechat-mobile-ua"
+    return text, f"wechat-mobile-ua ({WX_VERSION})"
 
 
 def is_valid(text: str) -> bool:
@@ -97,7 +114,6 @@ def main():
     url = sys.argv[1]
     out_path = sys.argv[2] if len(sys.argv) > 2 else None
 
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     print(f"[*] Fetching: {url}", flush=True)
     text, source = fetch_wechat_article(url)
 
